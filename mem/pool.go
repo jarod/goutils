@@ -8,9 +8,9 @@ import (
 
 // TODO move these consts as config parameters to create pool
 const (
-	blocksPerAlloc = 8
+	bytesPerAlloc  = 4096
 	blocksInGroup  = 4096
-	blockSizeInc   = 16
+	blockSizeInc   = 8
 	clusterCount   = 32
 	clusterMaxSize = 1048576 // 1M
 )
@@ -72,11 +72,12 @@ func (b *Block) Buffer() []byte {
 
 type cluster struct {
 	sync.Mutex
-	size                uint16
-	groups              uint16
-	muts                []*sync.Mutex
-	blocks              [][]*Block
-	popIndex, pushIndex uint16
+	size      uint16
+	groups    uint16
+	muts      []*sync.Mutex
+	blocks    [][]*Block
+	popIndex  uint32
+	pushIndex uint16
 }
 
 func newCluster(size uint16) *cluster {
@@ -95,8 +96,8 @@ func newCluster(size uint16) *cluster {
 
 func (c *cluster) Pop() (b *Block) {
 	c.Lock()
-	c.popIndex = (c.popIndex + 1) % c.groups
-	poi := c.popIndex
+	c.popIndex++
+	poi := c.popIndex % uint32(c.groups)
 	c.Unlock()
 
 	c.muts[poi].Lock()
@@ -108,12 +109,15 @@ func (c *cluster) Pop() (b *Block) {
 		c.muts[poi].Unlock()
 
 		// pre-allocation and put blocks[1,blocksPerAlloc-1] to pool
-		buf := make([]byte, c.size*blocksPerAlloc)
-		for i := 1; i < blocksPerAlloc; i++ {
-			begin := i * int(c.size)
-			b = newBlock(c, buf[begin:begin+int(c.size)])
-			c.push(b)
-		}
+		allocCount := (bytesPerAlloc / c.size) + 1
+		buf := make([]byte, allocCount*c.size)
+		go func() {
+			for i := uint16(1); i < allocCount; i++ {
+				begin := int(i * c.size)
+				b = newBlock(c, buf[begin:begin+int(c.size)])
+				c.push(b)
+			}
+		}()
 		// only return the first block (index 0)
 		b = newBlock(c, buf[:c.size])
 	}
@@ -129,10 +133,10 @@ func (c *cluster) push(b *Block) {
 
 	c.muts[pui].Lock()
 	defer c.muts[pui].Unlock()
-	l := len(c.blocks[pui])
-	if l >= blocksInGroup {
-		return
-	}
+	// l := len(c.blocks[pui])
+	// if l >= blocksInGroup {
+	// 	return
+	// }
 	c.blocks[pui] = append(c.blocks[pui], b)
 }
 
@@ -146,8 +150,11 @@ func (c *cluster) String() string {
 		lens[i] = uint16(len(c.blocks[i]))
 		total += uint32(lens[i])
 	}
-	b.WriteString(fmt.Sprintf("cluster{%d,groups:%d,len:%d %v}",
-		c.size, c.groups, total, lens))
+	c.Lock()
+	pop := c.popIndex
+	c.Unlock()
+	b.WriteString(fmt.Sprintf("cluster{%d,groups:%d,pop:%d,len:%d %v}",
+		c.size, c.groups, pop, total, lens))
 	return b.String()
 }
 
