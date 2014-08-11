@@ -8,12 +8,16 @@ import (
 
 // TODO move these consts as config parameters to create pool
 const (
-	bytesPerAlloc  = 4096
-	blocksInGroup  = 4096
-	blockSizeInc   = 8
-	clusterCount   = 32
-	clusterMaxSize = 1048576 // 1M
+	blockSizeInc = 8
+	clusterCount = 32
 )
+
+// PoolConfig .
+type poolConfig struct {
+	// max num of blocks per group in cluster
+	BlocksPerGroup uint16
+	BlocksPerAlloc uint16
+}
 
 // Block .
 type Block struct {
@@ -71,18 +75,21 @@ func (b *Block) Buffer() []byte {
 }
 
 type cluster struct {
-	sync.Mutex
-	size      uint16
-	groups    uint16
-	muts      []*sync.Mutex
-	blocks    [][]*Block
-	popIndex  uint32
-	pushIndex uint16
+	sync.RWMutex
+	pool        *Pool
+	size        uint16
+	groups      uint16
+	muts        []*sync.Mutex
+	blocks      [][]*Block
+	totalBlocks uint32
+	popIndex    uint32
+	pushIndex   uint16
 }
 
-func newCluster(size uint16) *cluster {
-	groups := uint16(clusterMaxSize/uint32(size)/blocksInGroup + 1)
+func newCluster(pool *Pool, size uint16) *cluster {
+	groups := uint16(1)
 	c := &cluster{
+		pool:   pool,
 		size:   size,
 		groups: groups,
 		muts:   make([]*sync.Mutex, groups),
@@ -107,19 +114,7 @@ func (c *cluster) Pop() (b *Block) {
 		c.muts[poi].Unlock()
 	} else {
 		c.muts[poi].Unlock()
-
-		// pre-allocation and put blocks[1,blocksPerAlloc-1] to pool
-		allocCount := (bytesPerAlloc / c.size) + 1
-		buf := make([]byte, allocCount*c.size)
-		go func() {
-			for i := uint16(1); i < allocCount; i++ {
-				begin := int(i * c.size)
-				b = newBlock(c, buf[begin:begin+int(c.size)])
-				c.push(b)
-			}
-		}()
-		// only return the first block (index 0)
-		b = newBlock(c, buf[:c.size])
+		b = c.preAlloc()
 	}
 	b.Retain()
 	return
@@ -133,11 +128,48 @@ func (c *cluster) push(b *Block) {
 
 	c.muts[pui].Lock()
 	defer c.muts[pui].Unlock()
-	// l := len(c.blocks[pui])
-	// if l >= blocksInGroup {
-	// 	return
-	// }
 	c.blocks[pui] = append(c.blocks[pui], b)
+}
+
+// pre-allocate and put blocks[1,blocksPerAlloc-1] to pool
+func (c *cluster) preAlloc() (b *Block) {
+	n := c.pool.Config.BlocksPerAlloc
+	buf := make([]byte, n*c.size)
+	c.pushPreAlloc(buf)
+	// only return the first block (index 0)
+	b = newBlock(c, buf[:c.size])
+
+	c.Lock()
+	defer c.Unlock()
+	c.totalBlocks += uint32(n)
+	if uint16(c.totalBlocks/uint32(c.pool.Config.BlocksPerGroup))+1 > c.groups {
+		c.blocks = append(c.blocks, []*Block{})
+		c.groups = uint16(len(c.blocks))
+		c.muts = append(c.muts, new(sync.Mutex))
+	}
+	return
+}
+
+func (c *cluster) pushPreAlloc(buf []byte) {
+	c.RLock()
+	gi := 0
+	min := len(c.blocks[0])
+	for i := 1; i < len(c.blocks); i++ {
+		l := len(c.blocks[i])
+		if l < min {
+			gi = i
+			min = l
+		}
+	}
+	c.RUnlock()
+
+	c.muts[gi].Lock()
+	defer c.muts[gi].Unlock()
+	for i := uint16(1); i < c.pool.Config.BlocksPerAlloc; i++ {
+		begin := int(i * c.size)
+		bl := newBlock(c, buf[begin:begin+int(c.size)])
+		c.blocks[gi] = append(c.blocks[gi], bl)
+	}
 }
 
 func (c *cluster) String() string {
@@ -150,11 +182,12 @@ func (c *cluster) String() string {
 		lens[i] = uint16(len(c.blocks[i]))
 		total += uint32(lens[i])
 	}
-	c.Lock()
+	c.RLock()
 	pop := c.popIndex
-	c.Unlock()
-	b.WriteString(fmt.Sprintf("cluster{%d,groups:%d,pop:%d,len:%d %v}",
-		c.size, c.groups, pop, total, lens))
+	alloc := c.totalBlocks
+	c.RUnlock()
+	b.WriteString(fmt.Sprintf("cluster{%d,groups:%d,pop:%d,len:%d/%d %v}",
+		c.size, c.groups, pop, total, alloc, lens))
 	return b.String()
 }
 
@@ -162,15 +195,20 @@ func (c *cluster) String() string {
 type Pool struct {
 	id       string
 	clusters [clusterCount]*cluster
+	Config   poolConfig
 }
 
 // NewPool .
 func NewPool(id string) *Pool {
 	p := &Pool{
 		id: id,
+		Config: poolConfig{
+			BlocksPerGroup: 4096,
+			BlocksPerAlloc: 32,
+		},
 	}
 	for i := uint16(0); i < clusterCount; i++ {
-		p.clusters[i] = newCluster((i + 1) * blockSizeInc)
+		p.clusters[i] = newCluster(p, (i+1)*blockSizeInc)
 	}
 	return p
 }
