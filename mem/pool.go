@@ -46,8 +46,9 @@ func newTempBlock(size uint16) *Block {
 
 func (b *Block) String() string {
 	b.Lock()
-	defer b.Unlock()
-	return fmt.Sprintf("Block{Cap:%d,Size:%d,Ref:%d}", len(b.data), b.size, b.ref)
+	s := fmt.Sprintf("Block{Cap:%d,Size:%d,Ref:%d}", len(b.data), b.size, b.ref)
+	b.Unlock()
+	return s
 }
 
 // Retain .
@@ -60,18 +61,19 @@ func (b *Block) Retain() {
 // Release .
 func (b *Block) Release() {
 	b.Lock()
-	defer b.Unlock()
 	b.ref--
 	if b.ref == 0 && b.c != nil {
 		b.c.push(b)
 	}
+	b.Unlock()
 }
 
 // Buffer .
 func (b *Block) Buffer() []byte {
 	b.Lock()
-	defer b.Unlock()
-	return b.data[:b.size]
+	data := b.data[:b.size]
+	b.Unlock()
+	return data
 }
 
 type cluster struct {
@@ -127,8 +129,8 @@ func (c *cluster) push(b *Block) {
 	c.Unlock()
 
 	c.muts[pui].Lock()
-	defer c.muts[pui].Unlock()
 	c.blocks[pui] = append(c.blocks[pui], b)
+	c.muts[pui].Unlock()
 }
 
 // pre-allocate and put blocks[1,blocksPerAlloc-1] to pool
@@ -140,19 +142,19 @@ func (c *cluster) preAlloc() (b *Block) {
 	b = newBlock(c, buf[:c.size])
 
 	c.Lock()
-	defer c.Unlock()
 	c.totalBlocks += uint32(n)
 	if uint16(c.totalBlocks/uint32(c.pool.Config.BlocksPerGroup))+1 > c.groups {
 		c.blocks = append(c.blocks, []*Block{})
 		c.groups = uint16(len(c.blocks))
 		c.muts = append(c.muts, new(sync.Mutex))
 	}
+	c.Unlock()
 	return
 }
 
 func (c *cluster) pushPreAlloc(buf []byte) {
-	c.RLock()
 	gi := 0
+	c.RLock()
 	min := len(c.blocks[0])
 	for i := 1; i < len(c.blocks); i++ {
 		l := len(c.blocks[i])
@@ -164,12 +166,12 @@ func (c *cluster) pushPreAlloc(buf []byte) {
 	c.RUnlock()
 
 	c.muts[gi].Lock()
-	defer c.muts[gi].Unlock()
 	for i := uint16(1); i < c.pool.Config.BlocksPerAlloc; i++ {
 		begin := int(i * c.size)
 		bl := newBlock(c, buf[begin:begin+int(c.size)])
 		c.blocks[gi] = append(c.blocks[gi], bl)
 	}
+	c.muts[gi].Unlock()
 }
 
 func (c *cluster) String() string {
@@ -178,9 +180,9 @@ func (c *cluster) String() string {
 	total := uint32(0)
 	for i, m := range c.muts {
 		m.Lock()
-		defer m.Unlock()
 		lens[i] = uint16(len(c.blocks[i]))
 		total += uint32(lens[i])
+		m.Unlock()
 	}
 	c.RLock()
 	pop := c.popIndex
